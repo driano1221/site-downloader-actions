@@ -3,3 +3,6 @@
 https://example.com
 https://httpbin.org/html
 https://www.ime.usp.br/~pam/
+https://acoesdoriodoce.com/
+https://aedasmg.org/
+https://www.anater.org/
