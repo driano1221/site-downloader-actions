@@ -9,3 +9,4 @@
 # URLs já processadas são registradas em processed_urls.txt automaticamente.
 
 https://example.com
+https://httpbin.org/html
