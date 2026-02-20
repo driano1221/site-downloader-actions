@@ -1,2 +1,4 @@
 # URLs já processadas pelo workflow (atualizado automaticamente pelo CI)
 # NÃO edite manualmente. Para reprocessar uma URL, remova-a deste arquivo.
+https://example.com
+https://httpbin.org/html
