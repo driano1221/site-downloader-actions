@@ -8,5 +8,4 @@
 # O workflow processa até 3 URLs por execução (agendamento diário).
 # URLs já processadas são registradas em processed_urls.txt automaticamente.
 
-https://example.com
-https://httpbin.org/html
+https://www.ime.usp.br/~pam/
