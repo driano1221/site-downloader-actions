@@ -131,19 +131,39 @@ jobs:
           SNAP="${{ steps.download.outputs.snapshot_path }}"
           SNAP_NAME=$(basename "$SNAP")
           DOMAIN=$(basename "$(dirname "$SNAP")")
-          ZIP_NAME="${DOMAIN}__${SNAP_NAME}.zip"
+          ZIP_BASE="${DOMAIN}__${SNAP_NAME}"
+          ZIP_NAME="${ZIP_BASE}.zip"
+          LIMIT_BYTES=$((1900 * 1024 * 1024))   # 1.9 GB em bytes
 
-          echo "Comprimindo snapshot: $SNAP → $ZIP_NAME"
+          echo "Comprimindo snapshot: $SNAP"
           cd snapshots
-          zip -r "../$ZIP_NAME" "$DOMAIN/$SNAP_NAME"
+          zip -r "../${ZIP_NAME}" "$DOMAIN/$SNAP_NAME"
           cd ..
 
-          ZIP_SIZE=$(du -sh "$ZIP_NAME" | cut -f1)
           ZIP_BYTES=$(stat -c%s "$ZIP_NAME")
+          ZIP_SIZE=$(du -sh "$ZIP_NAME" | cut -f1)
+          echo "Tamanho do zip: $ZIP_SIZE ($ZIP_BYTES bytes)"
 
-          echo "zip_name=$ZIP_NAME"   >> "$GITHUB_OUTPUT"
-          echo "zip_size=$ZIP_SIZE"   >> "$GITHUB_OUTPUT"
-          echo "zip_bytes=$ZIP_BYTES" >> "$GITHUB_OUTPUT"
+          if [ "$ZIP_BYTES" -gt "$LIMIT_BYTES" ]; then
+            # Arquivo maior que 1.9 GB → divide em partes de 1800 MB
+            echo "ZIP > 1.9 GB, dividindo em partes de 1800 MB..."
+            mkdir -p zip_parts
+            zip -r -s 1800m "zip_parts/${ZIP_BASE}.zip" "snapshots/$DOMAIN/$SNAP_NAME"
+            # Lista todas as partes geradas (z01, z02... + .zip final)
+            PARTS=$(ls zip_parts/${ZIP_BASE}.z?? zip_parts/${ZIP_BASE}.zip 2>/dev/null | tr '\n' ' ')
+            PART_COUNT=$(echo "$PARTS" | wc -w)
+            echo "Partes geradas: $PART_COUNT → $PARTS"
+            echo "zip_name="          >> "$GITHUB_OUTPUT"   # zip único não existe
+            echo "zip_parts=$PARTS"   >> "$GITHUB_OUTPUT"
+            echo "zip_size=$ZIP_SIZE" >> "$GITHUB_OUTPUT"
+            echo "split=true"         >> "$GITHUB_OUTPUT"
+            rm -f "$ZIP_NAME"
+          else
+            echo "zip_name=$ZIP_NAME"   >> "$GITHUB_OUTPUT"
+            echo "zip_parts="           >> "$GITHUB_OUTPUT"
+            echo "zip_size=$ZIP_SIZE"   >> "$GITHUB_OUTPUT"
+            echo "split=false"          >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Zipar PDFs
         id: zip_pdfs
@@ -170,7 +190,7 @@ jobs:
 
       - name: Criar/atualizar Release e fazer upload
         id: release
-        if: steps.zip_snap.outputs.zip_name != ''
+        if: steps.zip_snap.outputs.zip_name != '' || steps.zip_snap.outputs.zip_parts != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -187,9 +207,24 @@ jobs:
             echo "Release $TAG já existe, adicionando assets."
           fi
 
-          gh release upload "$TAG" "${{ steps.zip_snap.outputs.zip_name }}" --clobber
-          echo "Snapshot enviado: ${{ steps.zip_snap.outputs.zip_name }}"
+          # Upload: zip único OU partes divididas
+          ZIP_NAME="${{ steps.zip_snap.outputs.zip_name }}"
+          ZIP_PARTS="${{ steps.zip_snap.outputs.zip_parts }}"
 
+          if [ -n "$ZIP_NAME" ] && [ -f "$ZIP_NAME" ]; then
+            gh release upload "$TAG" "$ZIP_NAME" --clobber
+            echo "Snapshot enviado: $ZIP_NAME"
+          elif [ -n "$ZIP_PARTS" ]; then
+            echo "Enviando partes do snapshot (zip dividido)..."
+            for PART in $ZIP_PARTS; do
+              if [ -f "$PART" ]; then
+                gh release upload "$TAG" "$PART" --clobber
+                echo "  Parte enviada: $PART"
+              fi
+            done
+          fi
+
+          # Upload do zip de PDFs (se existir — PDFs raramente passam de 2GB)
           PDF_ZIP="${{ steps.zip_pdfs.outputs.pdf_zip_name }}"
           if [ -n "$PDF_ZIP" ] && [ -f "$PDF_ZIP" ]; then
             gh release upload "$TAG" "$PDF_ZIP" --clobber
@@ -212,13 +247,27 @@ jobs:
           url          = "${{ matrix.url }}"
           exit_code    = "${{ steps.download.outputs.exit_code }}"
           duration     = "${{ steps.download.outputs.duration }}"
+          duration_s   = int("${{ steps.download.outputs.duration_s }}" or "0")
           pdf_count    = "${{ steps.zip_pdfs.outputs.pdf_count }}"   or "0"
           zip_size     = "${{ steps.zip_snap.outputs.zip_size }}"    or "—"
+          split        = "${{ steps.zip_snap.outputs.split }}"       == "true"
           release_url  = "${{ steps.release.outputs.release_url }}"  or ""
           tag          = "${{ steps.release.outputs.tag }}"          or ""
 
-          status = "✅ OK" if exit_code == "0" else "❌ Falhou"
-          now    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+          TIMEOUT_THRESHOLD = 21500  # 6h = 21600s, flag a partir de 21500s
+          timed_out = duration_s >= TIMEOUT_THRESHOLD
+
+          if timed_out:
+              status = "⚠️ Parcial (timeout 6h)"
+          elif exit_code == "0":
+              status = "✅ OK"
+          else:
+              status = "❌ Falhou"
+
+          if split:
+              zip_size = zip_size + " ⚡dividido"
+
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
           if release_url:
               snap_link = f"[{tag}]({release_url})"
