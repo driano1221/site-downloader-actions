@@ -2,8 +2,8 @@ name: Download Sites
 
 "on":
   schedule:
-    # Roda todo dia às 6h UTC
-    - cron: '0 6 * * *'
+    - cron: '0 6 * * *'   # 6h UTC  = 3h Brasília (horário de verão) / madrugada
+    - cron: '0 18 * * *'  # 18h UTC = 15h Brasília — tarde, fora do horário de pico
   workflow_dispatch:
     inputs:
       max_sites:
@@ -12,10 +12,10 @@ name: Download Sites
         default: '3'
 
 permissions:
-  contents: write  # Para commitar processed_urls.txt e criar releases
+  contents: write
 
 jobs:
-  # ── JOB 1: Seleciona próximas URLs a processar ─────────────────────────────
+  # ── JOB 1: Seleciona próximas URLs ─────────────────────────────────────────
   prepare:
     name: Preparar lista de URLs
     runs-on: ubuntu-latest
@@ -31,14 +31,11 @@ jobs:
         id: select
         shell: python
         run: |
-          import json
-          import os
-          import re
+          import json, os
 
           max_sites = int("${{ github.event.inputs.max_sites || '3' }}")
           max_sites = max(1, min(3, max_sites))
 
-          # Lê sites.txt
           pending = []
           try:
               with open("sites.txt", encoding="utf-8") as f:
@@ -49,7 +46,6 @@ jobs:
           except FileNotFoundError:
               print("AVISO: sites.txt não encontrado")
 
-          # Lê processed_urls.txt
           processed = set()
           try:
               with open("processed_urls.txt", encoding="utf-8") as f:
@@ -60,11 +56,11 @@ jobs:
           except FileNotFoundError:
               pass
 
-          # Seleciona URLs ainda não processadas
           to_process = [u for u in pending if u not in processed][:max_sites]
 
-          print(f"Sites pendentes: {len(pending)}")
-          print(f"Já processados: {len(processed)}")
+          print(f"Sites no arquivo: {len(pending)}")
+          print(f"Já processados:   {len(processed)}")
+          print(f"Fila restante:    {len([u for u in pending if u not in processed])}")
           print(f"Selecionados agora: {len(to_process)}")
           for u in to_process:
               print(f"  → {u}")
@@ -99,23 +95,33 @@ jobs:
       - name: Baixar site
         id: download
         run: |
+          START_TS=$(date +%s)
+
           set +e
           OUTPUT=$(python downloader_cli.py \
             --url "${{ matrix.url }}" \
             --dest ./snapshots \
             --depth 2 \
             --wait 1.0 \
-            --timeout 600 \
+            --timeout 21600 \
             2>&1)
           EXIT_CODE=$?
           echo "$OUTPUT"
 
-          # Captura caminhos emitidos pelo script
+          END_TS=$(date +%s)
+          DURATION_S=$((END_TS - START_TS))
+          DURATION_MIN=$((DURATION_S / 60))
+          DURATION_SEC=$((DURATION_S % 60))
+          DURATION_FMT="${DURATION_MIN}m${DURATION_SEC}s"
+
           SNAP_PATH=$(echo "$OUTPUT" | grep '^SNAPSHOT_PATH=' | cut -d= -f2-)
           PDF_DIR=$(echo "$OUTPUT"   | grep '^PDF_DIR='       | cut -d= -f2-)
-          echo "snapshot_path=$SNAP_PATH" >> "$GITHUB_OUTPUT"
-          echo "pdf_dir=$PDF_DIR"         >> "$GITHUB_OUTPUT"
-          echo "exit_code=$EXIT_CODE"     >> "$GITHUB_OUTPUT"
+
+          echo "snapshot_path=$SNAP_PATH"   >> "$GITHUB_OUTPUT"
+          echo "pdf_dir=$PDF_DIR"           >> "$GITHUB_OUTPUT"
+          echo "exit_code=$EXIT_CODE"       >> "$GITHUB_OUTPUT"
+          echo "duration=$DURATION_FMT"     >> "$GITHUB_OUTPUT"
+          echo "duration_s=$DURATION_S"     >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Zipar snapshot completo
@@ -132,7 +138,12 @@ jobs:
           zip -r "../$ZIP_NAME" "$DOMAIN/$SNAP_NAME"
           cd ..
 
-          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          ZIP_SIZE=$(du -sh "$ZIP_NAME" | cut -f1)
+          ZIP_BYTES=$(stat -c%s "$ZIP_NAME")
+
+          echo "zip_name=$ZIP_NAME"   >> "$GITHUB_OUTPUT"
+          echo "zip_size=$ZIP_SIZE"   >> "$GITHUB_OUTPUT"
+          echo "zip_bytes=$ZIP_BYTES" >> "$GITHUB_OUTPUT"
 
       - name: Zipar PDFs
         id: zip_pdfs
@@ -153,11 +164,12 @@ jobs:
             echo "pdf_count=$PDF_COUNT"       >> "$GITHUB_OUTPUT"
           else
             echo "Nenhum PDF para zipar."
-            echo "pdf_zip_name="  >> "$GITHUB_OUTPUT"
-            echo "pdf_count=0"    >> "$GITHUB_OUTPUT"
+            echo "pdf_zip_name=" >> "$GITHUB_OUTPUT"
+            echo "pdf_count=0"   >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Criar/atualizar Release do dia e fazer upload
+      - name: Criar/atualizar Release e fazer upload
+        id: release
         if: steps.zip_snap.outputs.zip_name != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -165,7 +177,6 @@ jobs:
           TAG="snapshot-$(date -u +%Y-%m-%d)"
           TITLE="Snapshots de $(date -u +%d/%m/%Y)"
 
-          # Cria o release se ainda não existir
           if ! gh release view "$TAG" &>/dev/null; then
             gh release create "$TAG" \
               --title "$TITLE" \
@@ -176,22 +187,63 @@ jobs:
             echo "Release $TAG já existe, adicionando assets."
           fi
 
-          # Upload do snapshot completo
           gh release upload "$TAG" "${{ steps.zip_snap.outputs.zip_name }}" --clobber
           echo "Snapshot enviado: ${{ steps.zip_snap.outputs.zip_name }}"
 
-          # Upload do zip de PDFs (se existir)
           PDF_ZIP="${{ steps.zip_pdfs.outputs.pdf_zip_name }}"
           if [ -n "$PDF_ZIP" ] && [ -f "$PDF_ZIP" ]; then
             gh release upload "$TAG" "$PDF_ZIP" --clobber
-            echo "PDFs enviados: $PDF_ZIP (${{ steps.zip_pdfs.outputs.pdf_count }} PDFs)"
-          else
-            echo "Sem PDFs para enviar neste site."
+            echo "PDFs enviados: $PDF_ZIP"
           fi
 
-  # ── JOB 3: Atualiza cursor de URLs processadas ────────────────────────────
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/$TAG"
+          echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"                 >> "$GITHUB_OUTPUT"
+
+      - name: Registrar resultado no history.md
+        if: always() && steps.download.outputs.duration != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: python
+        run: |
+          import json, os, re
+          from datetime import datetime, timezone
+
+          url          = "${{ matrix.url }}"
+          exit_code    = "${{ steps.download.outputs.exit_code }}"
+          duration     = "${{ steps.download.outputs.duration }}"
+          pdf_count    = "${{ steps.zip_pdfs.outputs.pdf_count }}"   or "0"
+          zip_size     = "${{ steps.zip_snap.outputs.zip_size }}"    or "—"
+          release_url  = "${{ steps.release.outputs.release_url }}"  or ""
+          tag          = "${{ steps.release.outputs.tag }}"          or ""
+
+          status = "✅ OK" if exit_code == "0" else "❌ Falhou"
+          now    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+          if release_url:
+              snap_link = f"[{tag}]({release_url})"
+          else:
+              snap_link = "—"
+
+          row = f"| {now} | `{url}` | {status} | {duration} | {snap_link} | {pdf_count} PDFs | {zip_size} |"
+
+          try:
+              with open("history.md", encoding="utf-8") as f:
+                  content = f.read()
+          except FileNotFoundError:
+              content = "# 📋 Histórico de Execuções\n\n| Data/Hora (UTC) | Site | Status | Duração | Snapshot | PDFs | Tamanho |\n|---|---|---|---|---|---|---|\n<!-- HISTORY_ROWS -->\n"
+
+          # Insere a nova linha logo após o cabeçalho da tabela (antes de <!-- HISTORY_ROWS -->)
+          updated = content.replace("<!-- HISTORY_ROWS -->", f"{row}\n<!-- HISTORY_ROWS -->")
+
+          with open("history.md", "w", encoding="utf-8") as f:
+              f.write(updated)
+
+          print(f"Linha adicionada ao history.md: {row}")
+
+  # ── JOB 3: Commit de processed_urls.txt + history.md ──────────────────────
   update-cursor:
-    name: Atualizar processed_urls.txt
+    name: Atualizar histórico e cursor
     needs: [prepare, download]
     if: always() && needs.prepare.outputs.has_urls == 'true'
     runs-on: ubuntu-latest
@@ -199,22 +251,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Busca o estado mais recente (download jobs podem ter feito push do history.md)
+          fetch-depth: 0
 
-      - name: Adicionar URLs processadas ao cursor
+      - name: Pull para pegar history.md atualizado
+        run: git pull --rebase origin master || git pull --rebase origin main || true
+
+      - name: Adicionar URLs ao cursor
         shell: python
         run: |
           import json
 
           urls = json.loads('${{ needs.prepare.outputs.urls }}')
 
-          # Lê conteúdo existente
           try:
               with open("processed_urls.txt", encoding="utf-8") as f:
                   content = f.read()
           except FileNotFoundError:
               content = "# URLs já processadas pelo workflow (atualizado automaticamente pelo CI)\n# NÃO edite manualmente.\n"
 
-          # Adiciona novas URLs
           existing = set(
               line.strip() for line in content.splitlines()
               if line.strip() and not line.strip().startswith("#")
@@ -225,20 +281,20 @@ jobs:
               with open("processed_urls.txt", "a", encoding="utf-8") as f:
                   for u in new_urls:
                       f.write(f"{u}\n")
-              print(f"Adicionadas {len(new_urls)} URLs ao cursor:")
+              print(f"Adicionadas {len(new_urls)} URLs ao cursor.")
               for u in new_urls:
                   print(f"  + {u}")
           else:
-              print("Nenhuma URL nova para adicionar ao cursor.")
+              print("Nenhuma URL nova para adicionar.")
 
-      - name: Commitar processed_urls.txt
+      - name: Commitar processed_urls.txt e history.md
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add processed_urls.txt
+          git add processed_urls.txt history.md
           if git diff --cached --quiet; then
             echo "Nenhuma mudança para commitar."
           else
-            git commit -m "ci: atualizar processed_urls.txt [skip ci]"
+            git commit -m "ci: atualizar cursor e histórico [skip ci]"
             git push
           fi
