@@ -110,17 +110,16 @@ jobs:
           EXIT_CODE=$?
           echo "$OUTPUT"
 
-          # Captura o caminho do snapshot
+          # Captura caminhos emitidos pelo script
           SNAP_PATH=$(echo "$OUTPUT" | grep '^SNAPSHOT_PATH=' | cut -d= -f2-)
+          PDF_DIR=$(echo "$OUTPUT"   | grep '^PDF_DIR='       | cut -d= -f2-)
           echo "snapshot_path=$SNAP_PATH" >> "$GITHUB_OUTPUT"
-          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
-
-          # Sai com sucesso mesmo se wget teve erros parciais (exit 1 do nosso script
-          # só indica falha fatal; erros parciais são aceitáveis)
+          echo "pdf_dir=$PDF_DIR"         >> "$GITHUB_OUTPUT"
+          echo "exit_code=$EXIT_CODE"     >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: Criar arquivo zip do snapshot
-        id: zip
+      - name: Zipar snapshot completo
+        id: zip_snap
         if: steps.download.outputs.snapshot_path != ''
         run: |
           SNAP="${{ steps.download.outputs.snapshot_path }}"
@@ -128,20 +127,41 @@ jobs:
           DOMAIN=$(basename "$(dirname "$SNAP")")
           ZIP_NAME="${DOMAIN}__${SNAP_NAME}.zip"
 
-          echo "Comprimindo: $SNAP → $ZIP_NAME"
+          echo "Comprimindo snapshot: $SNAP → $ZIP_NAME"
           cd snapshots
           zip -r "../$ZIP_NAME" "$DOMAIN/$SNAP_NAME"
           cd ..
 
           echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
-          echo "zip_size=$(du -sh "$ZIP_NAME" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Zipar PDFs
+        id: zip_pdfs
+        if: steps.download.outputs.pdf_dir != ''
+        run: |
+          PDF_DIR="${{ steps.download.outputs.pdf_dir }}"
+          SNAP="${{ steps.download.outputs.snapshot_path }}"
+          DOMAIN=$(basename "$(dirname "$SNAP")")
+          SNAP_NAME=$(basename "$SNAP")
+          PDF_ZIP_NAME="${DOMAIN}__${SNAP_NAME}__PDFs.zip"
+
+          PDF_COUNT=$(find "$PDF_DIR" -name "*.pdf" | wc -l)
+          echo "PDFs encontrados: $PDF_COUNT"
+
+          if [ "$PDF_COUNT" -gt 0 ]; then
+            zip -r "$PDF_ZIP_NAME" "$PDF_DIR"
+            echo "pdf_zip_name=$PDF_ZIP_NAME" >> "$GITHUB_OUTPUT"
+            echo "pdf_count=$PDF_COUNT"       >> "$GITHUB_OUTPUT"
+          else
+            echo "Nenhum PDF para zipar."
+            echo "pdf_zip_name="  >> "$GITHUB_OUTPUT"
+            echo "pdf_count=0"    >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Criar/atualizar Release do dia e fazer upload
-        if: steps.zip.outputs.zip_name != ''
+        if: steps.zip_snap.outputs.zip_name != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ZIP="${{ steps.zip.outputs.zip_name }}"
           TAG="snapshot-$(date -u +%Y-%m-%d)"
           TITLE="Snapshots de $(date -u +%d/%m/%Y)"
 
@@ -153,12 +173,21 @@ jobs:
               --latest
             echo "Release $TAG criado."
           else
-            echo "Release $TAG já existe, apenas adicionando asset."
+            echo "Release $TAG já existe, adicionando assets."
           fi
 
-          # Upload do zip
-          gh release upload "$TAG" "$ZIP" --clobber
-          echo "Asset $ZIP enviado para release $TAG."
+          # Upload do snapshot completo
+          gh release upload "$TAG" "${{ steps.zip_snap.outputs.zip_name }}" --clobber
+          echo "Snapshot enviado: ${{ steps.zip_snap.outputs.zip_name }}"
+
+          # Upload do zip de PDFs (se existir)
+          PDF_ZIP="${{ steps.zip_pdfs.outputs.pdf_zip_name }}"
+          if [ -n "$PDF_ZIP" ] && [ -f "$PDF_ZIP" ]; then
+            gh release upload "$TAG" "$PDF_ZIP" --clobber
+            echo "PDFs enviados: $PDF_ZIP (${{ steps.zip_pdfs.outputs.pdf_count }} PDFs)"
+          else
+            echo "Sem PDFs para enviar neste site."
+          fi
 
   # ── JOB 3: Atualiza cursor de URLs processadas ────────────────────────────
   update-cursor:

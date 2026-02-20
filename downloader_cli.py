@@ -512,6 +512,188 @@ def finalize_artifacts(
 
 
 # ============================================================================
+# PDF COLLECTOR (porta do PdfCollector do script original)
+# ============================================================================
+
+@dataclass
+class PdfEntry:
+    """Representa um PDF encontrado no snapshot"""
+    path: Path
+    domain: str
+    snapshot: str
+    size_bytes: int
+    sha256: str = ""
+
+    @property
+    def filename(self) -> str:
+        return self.path.name
+
+    @property
+    def size_human(self) -> str:
+        b = self.size_bytes
+        if b < 1024:
+            return f"{b} B"
+        elif b < 1024 ** 2:
+            return f"{b / 1024:.1f} KB"
+        elif b < 1024 ** 3:
+            return f"{b / 1024 ** 2:.1f} MB"
+        return f"{b / 1024 ** 3:.2f} GB"
+
+
+class PdfCollector:
+    """
+    Varre o snapshot, copia PDFs para _PDFs/<dominio>/ e gera indice_pdfs.json.
+
+    Estrutura de saída dentro do snapshot:
+        <snapshot_root>/
+        └── _PDFs/
+            ├── dominio.com/
+            │   ├── relatorio.pdf
+            │   └── dados.pdf
+            └── indice_pdfs.json
+    """
+
+    PDF_DIR_NAME = "_PDFs"
+
+    def __init__(self, snapshot: SnapshotPaths) -> None:
+        self.snapshot = snapshot
+        self.pdf_root = snapshot.root / self.PDF_DIR_NAME
+
+    def scan(self) -> list[PdfEntry]:
+        """Varre OFFLINE/ procurando .pdf e retorna lista de PdfEntry."""
+        entries: list[PdfEntry] = []
+        search_root = self.snapshot.offline
+        if not search_root.exists():
+            return entries
+
+        for dirpath, dirnames, filenames in os.walk(str(search_root)):
+            # Não entrar na própria pasta de PDFs
+            dirnames[:] = [d for d in dirnames if d != self.PDF_DIR_NAME]
+            for filename in filenames:
+                if not filename.lower().endswith(".pdf"):
+                    continue
+                full_path = Path(dirpath) / filename
+                try:
+                    size = full_path.stat().st_size
+                except OSError:
+                    continue
+
+                try:
+                    rel = full_path.relative_to(self.snapshot.root)
+                    parts = rel.parts
+                    # partes: OFFLINE / dominio / ... / arquivo.pdf
+                    domain = parts[1] if len(parts) > 1 else "desconhecido"
+                    snap_name = self.snapshot.root.name
+                except ValueError:
+                    domain = "desconhecido"
+                    snap_name = ""
+
+                entries.append(PdfEntry(
+                    path=full_path,
+                    domain=domain,
+                    snapshot=snap_name,
+                    size_bytes=size,
+                ))
+
+        return entries
+
+    def collect(self, entries: list[PdfEntry], calc_hashes: bool = True) -> list[PdfEntry]:
+        """Copia PDFs para _PDFs/<dominio>/, resolve colisões de nome."""
+        if not entries:
+            return entries
+
+        ensure_dir(self.pdf_root)
+        seen: dict[str, int] = {}
+
+        for entry in entries:
+            domain_dir = self.pdf_root / entry.domain
+            ensure_dir(domain_dir)
+            dst = domain_dir / entry.filename
+
+            # Resolve colisão de nomes
+            dst_key = str(dst).lower()
+            if dst_key in seen:
+                seen[dst_key] += 1
+                dst = domain_dir / f"{dst.stem}_{seen[dst_key]}{dst.suffix}"
+            else:
+                seen[dst_key] = 0
+
+            try:
+                # Pula se já existe com mesmo tamanho
+                if not (dst.exists() and dst.stat().st_size == entry.size_bytes):
+                    shutil.copy2(str(entry.path), str(dst))
+                logging.info(f"PDF: {entry.domain}/{dst.name} ({entry.size_human})")
+            except Exception as e:
+                logging.warning(f"Erro ao copiar {entry.filename}: {e}")
+                continue
+
+            if calc_hashes:
+                try:
+                    entry.sha256 = sha256_file(dst)
+                except Exception as e:
+                    logging.warning(f"Hash falhou para {dst.name}: {e}")
+
+        return entries
+
+    def save_index(self, entries: list[PdfEntry]) -> Path:
+        """Grava indice_pdfs.json com metadados de todos os PDFs."""
+        index_path = self.pdf_root / "indice_pdfs.json"
+        data = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "snapshot": self.snapshot.root.name,
+            "total": len(entries),
+            "total_bytes": sum(e.size_bytes for e in entries),
+            "total_human": PdfEntry(Path(), "", "", sum(e.size_bytes for e in entries)).size_human,
+            "pdfs": [
+                {
+                    "filename": e.filename,
+                    "domain": e.domain,
+                    "size_bytes": e.size_bytes,
+                    "size_human": e.size_human,
+                    "sha256": e.sha256,
+                    "path": f"_PDFs/{e.domain}/{e.filename}",
+                }
+                for e in entries
+            ],
+        }
+        try:
+            ensure_dir(self.pdf_root)
+            index_path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logging.info(f"Índice de PDFs salvo: {index_path}")
+        except Exception as e:
+            logging.error(f"Erro ao salvar índice de PDFs: {e}")
+        return index_path
+
+
+def collect_pdfs(snapshot: SnapshotPaths) -> int:
+    """
+    Orquestra a coleta de PDFs do snapshot.
+    Retorna o número de PDFs encontrados.
+    """
+    collector = PdfCollector(snapshot)
+    logging.info("Varrendo OFFLINE/ em busca de PDFs...")
+    entries = collector.scan()
+
+    if not entries:
+        logging.info("Nenhum PDF encontrado no snapshot.")
+        return 0
+
+    total_size = sum(e.size_bytes for e in entries)
+    size_h = entries[0].__class__(Path(), "", "", total_size).size_human
+    logging.info(f"PDFs encontrados: {len(entries)} ({size_h} total)")
+
+    entries = collector.collect(entries, calc_hashes=True)
+    collector.save_index(entries)
+
+    # Imprime caminho da pasta de PDFs para o workflow capturar
+    print(f"PDF_DIR={collector.pdf_root}")
+    return len(entries)
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -633,6 +815,10 @@ def main() -> int:
         full_hash=args.full_hash,
         start_ts=start_ts,
     )
+
+    # Coleta PDFs do snapshot
+    if offline:
+        collect_pdfs(snapshot)
 
     logging.info(f"Snapshot salvo em: {snapshot.root}")
     # Imprime o caminho do snapshot para o workflow capturar
