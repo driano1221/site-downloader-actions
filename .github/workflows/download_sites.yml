@@ -1,6 +1,6 @@
 name: Download Sites
 
-on:
+"on":
   schedule:
     # Roda todo dia às 6h UTC
     - cron: '0 6 * * *'
