@@ -173,19 +173,40 @@ jobs:
           SNAP="${{ steps.download.outputs.snapshot_path }}"
           DOMAIN=$(basename "$(dirname "$SNAP")")
           SNAP_NAME=$(basename "$SNAP")
-          PDF_ZIP_NAME="${DOMAIN}__${SNAP_NAME}__PDFs.zip"
+          PDF_ZIP_BASE="${DOMAIN}__${SNAP_NAME}__PDFs"
+          PDF_ZIP_NAME="${PDF_ZIP_BASE}.zip"
+          LIMIT_BYTES=$((1900 * 1024 * 1024))   # 1.9 GB em bytes
 
           PDF_COUNT=$(find "$PDF_DIR" -name "*.pdf" | wc -l)
           echo "PDFs encontrados: $PDF_COUNT"
 
           if [ "$PDF_COUNT" -gt 0 ]; then
             zip -r "$PDF_ZIP_NAME" "$PDF_DIR"
-            echo "pdf_zip_name=$PDF_ZIP_NAME" >> "$GITHUB_OUTPUT"
-            echo "pdf_count=$PDF_COUNT"       >> "$GITHUB_OUTPUT"
+            PDF_ZIP_BYTES=$(stat -c%s "$PDF_ZIP_NAME")
+            PDF_ZIP_SIZE=$(du -sh "$PDF_ZIP_NAME" | cut -f1)
+            echo "Tamanho do PDF zip: $PDF_ZIP_SIZE ($PDF_ZIP_BYTES bytes)"
+
+            if [ "$PDF_ZIP_BYTES" -gt "$LIMIT_BYTES" ]; then
+              echo "PDF ZIP > 1.9 GB, dividindo em partes de 1800 MB..."
+              mkdir -p zip_parts
+              zip -r -s 1800m "zip_parts/${PDF_ZIP_BASE}.zip" "$PDF_DIR"
+              PDF_PARTS=$(ls zip_parts/${PDF_ZIP_BASE}.z?? zip_parts/${PDF_ZIP_BASE}.zip 2>/dev/null | tr '\n' ' ')
+              PDF_PART_COUNT=$(echo "$PDF_PARTS" | wc -w)
+              echo "Partes de PDF geradas: $PDF_PART_COUNT → $PDF_PARTS"
+              echo "pdf_zip_name="             >> "$GITHUB_OUTPUT"
+              echo "pdf_zip_parts=$PDF_PARTS" >> "$GITHUB_OUTPUT"
+              echo "pdf_count=$PDF_COUNT"     >> "$GITHUB_OUTPUT"
+              rm -f "$PDF_ZIP_NAME"
+            else
+              echo "pdf_zip_name=$PDF_ZIP_NAME" >> "$GITHUB_OUTPUT"
+              echo "pdf_zip_parts="             >> "$GITHUB_OUTPUT"
+              echo "pdf_count=$PDF_COUNT"       >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "Nenhum PDF para zipar."
-            echo "pdf_zip_name=" >> "$GITHUB_OUTPUT"
-            echo "pdf_count=0"   >> "$GITHUB_OUTPUT"
+            echo "pdf_zip_name="  >> "$GITHUB_OUTPUT"
+            echo "pdf_zip_parts=" >> "$GITHUB_OUTPUT"
+            echo "pdf_count=0"    >> "$GITHUB_OUTPUT"
           fi
 
       - name: Criar/atualizar Release e fazer upload
@@ -224,11 +245,20 @@ jobs:
             done
           fi
 
-          # Upload do zip de PDFs (se existir — PDFs raramente passam de 2GB)
+          # Upload do zip de PDFs (único ou dividido)
           PDF_ZIP="${{ steps.zip_pdfs.outputs.pdf_zip_name }}"
+          PDF_PARTS="${{ steps.zip_pdfs.outputs.pdf_zip_parts }}"
           if [ -n "$PDF_ZIP" ] && [ -f "$PDF_ZIP" ]; then
             gh release upload "$TAG" "$PDF_ZIP" --clobber
             echo "PDFs enviados: $PDF_ZIP"
+          elif [ -n "$PDF_PARTS" ]; then
+            echo "Enviando partes do PDF zip (zip dividido)..."
+            for PART in $PDF_PARTS; do
+              if [ -f "$PART" ]; then
+                gh release upload "$TAG" "$PART" --clobber
+                echo "  Parte enviada: $PART"
+              fi
+            done
           fi
 
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/$TAG"
