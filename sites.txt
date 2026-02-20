@@ -1,0 +1,11 @@
+# Lista de sites para baixar
+# Uma URL por linha. Linhas com # são ignoradas. Linhas em branco também.
+#
+# Exemplos:
+#   https://example.com
+#   https://meu-site.gov.br/pagina
+#
+# O workflow processa até 3 URLs por execução (agendamento diário).
+# URLs já processadas são registradas em processed_urls.txt automaticamente.
+
+https://example.com

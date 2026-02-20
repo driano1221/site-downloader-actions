@@ -1,0 +1,215 @@
+name: Download Sites
+
+on:
+  schedule:
+    # Roda todo dia às 6h UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      max_sites:
+        description: 'Número máximo de sites a processar (1-3)'
+        required: false
+        default: '3'
+
+permissions:
+  contents: write  # Para commitar processed_urls.txt e criar releases
+
+jobs:
+  # ── JOB 1: Seleciona próximas URLs a processar ─────────────────────────────
+  prepare:
+    name: Preparar lista de URLs
+    runs-on: ubuntu-latest
+    outputs:
+      urls: ${{ steps.select.outputs.urls }}
+      has_urls: ${{ steps.select.outputs.has_urls }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Selecionar próximas URLs
+        id: select
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+
+          max_sites = int("${{ github.event.inputs.max_sites || '3' }}")
+          max_sites = max(1, min(3, max_sites))
+
+          # Lê sites.txt
+          pending = []
+          try:
+              with open("sites.txt", encoding="utf-8") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line and not line.startswith("#"):
+                          pending.append(line)
+          except FileNotFoundError:
+              print("AVISO: sites.txt não encontrado")
+
+          # Lê processed_urls.txt
+          processed = set()
+          try:
+              with open("processed_urls.txt", encoding="utf-8") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line and not line.startswith("#"):
+                          processed.add(line)
+          except FileNotFoundError:
+              pass
+
+          # Seleciona URLs ainda não processadas
+          to_process = [u for u in pending if u not in processed][:max_sites]
+
+          print(f"Sites pendentes: {len(pending)}")
+          print(f"Já processados: {len(processed)}")
+          print(f"Selecionados agora: {len(to_process)}")
+          for u in to_process:
+              print(f"  → {u}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"urls={json.dumps(to_process)}\n")
+              fh.write(f"has_urls={'true' if to_process else 'false'}\n")
+
+  # ── JOB 2: Baixa cada site em paralelo ────────────────────────────────────
+  download:
+    name: Baixar ${{ matrix.url }}
+    needs: prepare
+    if: needs.prepare.outputs.has_urls == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        url: ${{ fromJson(needs.prepare.outputs.urls) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar wget
+        run: sudo apt-get install -y wget
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Baixar site
+        id: download
+        run: |
+          set +e
+          OUTPUT=$(python downloader_cli.py \
+            --url "${{ matrix.url }}" \
+            --dest ./snapshots \
+            --depth 2 \
+            --wait 1.0 \
+            --timeout 600 \
+            2>&1)
+          EXIT_CODE=$?
+          echo "$OUTPUT"
+
+          # Captura o caminho do snapshot
+          SNAP_PATH=$(echo "$OUTPUT" | grep '^SNAPSHOT_PATH=' | cut -d= -f2-)
+          echo "snapshot_path=$SNAP_PATH" >> "$GITHUB_OUTPUT"
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          # Sai com sucesso mesmo se wget teve erros parciais (exit 1 do nosso script
+          # só indica falha fatal; erros parciais são aceitáveis)
+          exit 0
+
+      - name: Criar arquivo zip do snapshot
+        id: zip
+        if: steps.download.outputs.snapshot_path != ''
+        run: |
+          SNAP="${{ steps.download.outputs.snapshot_path }}"
+          SNAP_NAME=$(basename "$SNAP")
+          DOMAIN=$(basename "$(dirname "$SNAP")")
+          ZIP_NAME="${DOMAIN}__${SNAP_NAME}.zip"
+
+          echo "Comprimindo: $SNAP → $ZIP_NAME"
+          cd snapshots
+          zip -r "../$ZIP_NAME" "$DOMAIN/$SNAP_NAME"
+          cd ..
+
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "zip_size=$(du -sh "$ZIP_NAME" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Criar/atualizar Release do dia e fazer upload
+        if: steps.zip.outputs.zip_name != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ZIP="${{ steps.zip.outputs.zip_name }}"
+          TAG="snapshot-$(date -u +%Y-%m-%d)"
+          TITLE="Snapshots de $(date -u +%d/%m/%Y)"
+
+          # Cria o release se ainda não existir
+          if ! gh release view "$TAG" &>/dev/null; then
+            gh release create "$TAG" \
+              --title "$TITLE" \
+              --notes "Snapshots gerados automaticamente em $(date -u +'%d/%m/%Y às %H:%M UTC')." \
+              --latest
+            echo "Release $TAG criado."
+          else
+            echo "Release $TAG já existe, apenas adicionando asset."
+          fi
+
+          # Upload do zip
+          gh release upload "$TAG" "$ZIP" --clobber
+          echo "Asset $ZIP enviado para release $TAG."
+
+  # ── JOB 3: Atualiza cursor de URLs processadas ────────────────────────────
+  update-cursor:
+    name: Atualizar processed_urls.txt
+    needs: [prepare, download]
+    if: always() && needs.prepare.outputs.has_urls == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Adicionar URLs processadas ao cursor
+        shell: python
+        run: |
+          import json
+
+          urls = json.loads('${{ needs.prepare.outputs.urls }}')
+
+          # Lê conteúdo existente
+          try:
+              with open("processed_urls.txt", encoding="utf-8") as f:
+                  content = f.read()
+          except FileNotFoundError:
+              content = "# URLs já processadas pelo workflow (atualizado automaticamente pelo CI)\n# NÃO edite manualmente.\n"
+
+          # Adiciona novas URLs
+          existing = set(
+              line.strip() for line in content.splitlines()
+              if line.strip() and not line.strip().startswith("#")
+          )
+          new_urls = [u for u in urls if u not in existing]
+
+          if new_urls:
+              with open("processed_urls.txt", "a", encoding="utf-8") as f:
+                  for u in new_urls:
+                      f.write(f"{u}\n")
+              print(f"Adicionadas {len(new_urls)} URLs ao cursor:")
+              for u in new_urls:
+                  print(f"  + {u}")
+          else:
+              print("Nenhuma URL nova para adicionar ao cursor.")
+
+      - name: Commitar processed_urls.txt
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add processed_urls.txt
+          if git diff --cached --quiet; then
+            echo "Nenhuma mudança para commitar."
+          else
+            git commit -m "ci: atualizar processed_urls.txt [skip ci]"
+            git push
+          fi
