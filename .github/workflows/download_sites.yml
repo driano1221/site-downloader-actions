@@ -265,13 +265,10 @@ jobs:
           echo "release_url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG"                 >> "$GITHUB_OUTPUT"
 
-      - name: Registrar resultado no history.md
+      - name: Gerar linha de histórico
         if: always() && steps.download.outputs.duration != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: python
         run: |
-          import json, os, re
           from datetime import datetime, timezone
 
           url          = "${{ matrix.url }}"
@@ -298,27 +295,21 @@ jobs:
               zip_size = zip_size + " ⚡dividido"
 
           now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-
-          if release_url:
-              snap_link = f"[{tag}]({release_url})"
-          else:
-              snap_link = "—"
+          snap_link = f"[{tag}]({release_url})" if release_url else "—"
 
           row = f"| {now} | `{url}` | {status} | {duration} | {snap_link} | {pdf_count} PDFs | {zip_size} |"
 
-          try:
-              with open("history.md", encoding="utf-8") as f:
-                  content = f.read()
-          except FileNotFoundError:
-              content = "# 📋 Histórico de Execuções\n\n| Data/Hora (UTC) | Site | Status | Duração | Snapshot | PDFs | Tamanho |\n|---|---|---|---|---|---|---|\n<!-- HISTORY_ROWS -->\n"
+          with open("history_row.txt", "w", encoding="utf-8") as f:
+              f.write(row)
 
-          # Insere a nova linha logo após o cabeçalho da tabela (antes de <!-- HISTORY_ROWS -->)
-          updated = content.replace("<!-- HISTORY_ROWS -->", f"{row}\n<!-- HISTORY_ROWS -->")
+          print(f"Linha gerada: {row}")
 
-          with open("history.md", "w", encoding="utf-8") as f:
-              f.write(updated)
-
-          print(f"Linha adicionada ao history.md: {row}")
+      - name: Salvar linha de histórico como artifact
+        if: always() && steps.download.outputs.duration != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-row-${{ strategy.job-index }}
+          path: history_row.txt
 
   # ── JOB 3: Commit de processed_urls.txt + history.md ──────────────────────
   update-cursor:
@@ -330,12 +321,38 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          # Busca o estado mais recente (download jobs podem ter feito push do history.md)
-          fetch-depth: 0
 
-      - name: Pull para pegar history.md atualizado
-        run: git pull --rebase origin master || git pull --rebase origin main || true
+      - name: Baixar linhas de histórico (artifacts)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: history-row-*
+          path: history_rows/
+          merge-multiple: false
+
+      - name: Inserir linhas no history.md
+        shell: python
+        run: |
+          import glob
+
+          rows = []
+          for path in sorted(glob.glob("history_rows/*/history_row.txt")):
+              with open(path, encoding="utf-8") as f:
+                  row = f.read().strip()
+                  if row:
+                      rows.append(row)
+
+          if not rows:
+              print("Nenhuma linha de histórico encontrada nos artifacts.")
+          else:
+              with open("history.md", encoding="utf-8") as f:
+                  content = f.read()
+              for row in rows:
+                  content = content.replace("<!-- HISTORY_ROWS -->", f"{row}\n<!-- HISTORY_ROWS -->")
+              with open("history.md", "w", encoding="utf-8") as f:
+                  f.write(content)
+              print(f"{len(rows)} linha(s) inserida(s) no history.md.")
+              for r in rows:
+                  print(f"  {r}")
 
       - name: Adicionar URLs ao cursor
         shell: python
