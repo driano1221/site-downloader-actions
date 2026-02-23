@@ -75,6 +75,7 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.has_urls == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
@@ -101,9 +102,9 @@ jobs:
           OUTPUT=$(python downloader_cli.py \
             --url "${{ matrix.url }}" \
             --dest ./snapshots \
-            --depth 2 \
+            --depth 1 \
             --wait 1.0 \
-            --timeout 21600 \
+            --timeout 18000 \
             2>&1)
           EXIT_CODE=$?
           echo "$OUTPUT"
