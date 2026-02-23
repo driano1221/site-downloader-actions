@@ -98,11 +98,18 @@ jobs:
         run: |
           START_TS=$(date +%s)
 
+          URL="${{ matrix.url }}"
+          if echo "$URL" | grep -q "gov\.br"; then
+            DEPTH=1
+          else
+            DEPTH=2
+          fi
+
           set +e
           OUTPUT=$(python downloader_cli.py \
-            --url "${{ matrix.url }}" \
+            --url "$URL" \
             --dest ./snapshots \
-            --depth 1 \
+            --depth $DEPTH \
             --wait 1.0 \
             --timeout 18000 \
             2>&1)
