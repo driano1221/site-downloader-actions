@@ -289,11 +289,11 @@ jobs:
           release_url  = "${{ steps.release.outputs.release_url }}"  or ""
           tag          = "${{ steps.release.outputs.tag }}"          or ""
 
-          TIMEOUT_THRESHOLD = 21500  # 6h = 21600s, flag a partir de 21500s
+          TIMEOUT_THRESHOLD = 17900  # 5h = 18000s, flag a partir de 17900s
           timed_out = duration_s >= TIMEOUT_THRESHOLD
 
           if timed_out:
-              status = "⚠️ Parcial (timeout 6h)"
+              status = "⚠️ Parcial (timeout 5h)"
           elif exit_code == "0":
               status = "✅ OK"
           else:
@@ -310,6 +310,10 @@ jobs:
           with open("history_row.txt", "w", encoding="utf-8") as f:
               f.write(row)
 
+          # Salva a URL para que update-cursor saiba quais downloads realmente rodaram
+          with open("completed_url.txt", "w", encoding="utf-8") as f:
+              f.write(url)
+
           print(f"Linha gerada: {row}")
 
       - name: Salvar linha de histórico como artifact
@@ -317,7 +321,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: history-row-${{ strategy.job-index }}
-          path: history_row.txt
+          path: |
+            history_row.txt
+            completed_url.txt
 
   # ── JOB 3: Commit de processed_urls.txt + history.md ──────────────────────
   update-cursor:
@@ -365,31 +371,41 @@ jobs:
       - name: Adicionar URLs ao cursor
         shell: python
         run: |
-          import json
+          import glob
 
-          urls = json.loads('${{ needs.prepare.outputs.urls }}')
+          # Só adiciona URLs cujo download de fato iniciou (tem completed_url.txt no artifact)
+          # Jobs cancelados antes do download não geram esse arquivo.
+          completed_urls = []
+          for path in sorted(glob.glob("history_rows/*/completed_url.txt")):
+              with open(path, encoding="utf-8") as f:
+                  url = f.read().strip()
+                  if url:
+                      completed_urls.append(url)
 
-          try:
-              with open("processed_urls.txt", encoding="utf-8") as f:
-                  content = f.read()
-          except FileNotFoundError:
-              content = "# URLs já processadas pelo workflow (atualizado automaticamente pelo CI)\n# NÃO edite manualmente.\n"
-
-          existing = set(
-              line.strip() for line in content.splitlines()
-              if line.strip() and not line.strip().startswith("#")
-          )
-          new_urls = [u for u in urls if u not in existing]
-
-          if new_urls:
-              with open("processed_urls.txt", "a", encoding="utf-8") as f:
-                  for u in new_urls:
-                      f.write(f"{u}\n")
-              print(f"Adicionadas {len(new_urls)} URLs ao cursor.")
-              for u in new_urls:
-                  print(f"  + {u}")
+          if not completed_urls:
+              print("Nenhuma URL completada para adicionar ao cursor.")
           else:
-              print("Nenhuma URL nova para adicionar.")
+              try:
+                  with open("processed_urls.txt", encoding="utf-8") as f:
+                      content = f.read()
+              except FileNotFoundError:
+                  content = "# URLs já processadas pelo workflow (atualizado automaticamente pelo CI)\n# NÃO edite manualmente.\n"
+
+              existing = set(
+                  line.strip() for line in content.splitlines()
+                  if line.strip() and not line.strip().startswith("#")
+              )
+              new_urls = [u for u in completed_urls if u not in existing]
+
+              if new_urls:
+                  with open("processed_urls.txt", "a", encoding="utf-8") as f:
+                      for u in new_urls:
+                          f.write(f"{u}\n")
+                  print(f"Adicionadas {len(new_urls)} URLs ao cursor.")
+                  for u in new_urls:
+                      print(f"  + {u}")
+              else:
+                  print("Nenhuma URL nova para adicionar.")
 
       - name: Commitar processed_urls.txt e history.md
         run: |

@@ -34,6 +34,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -335,27 +336,36 @@ def run_wget(args: list[str], snapshot: SnapshotPaths, timeout: int) -> bool:
 
     logging.info(f"wget PID={proc.pid}")
 
-    try:
-        with snapshot.wget_log.open("a", encoding="utf-8", errors="replace") as logf:
-            for line in proc.stdout:
+    def _drain(pipe, logf):
+        try:
+            for line in pipe:
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 logf.write(line)
-    except Exception as e:
-        logging.warning(f"Erro ao ler saída do wget: {e}")
+        except Exception as e:
+            logging.warning(f"Erro ao ler saída do wget: {e}")
 
+    rc = -1
     try:
-        rc = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        logging.warning(f"Timeout de {timeout}s excedido, encerrando wget")
-        try:
-            proc.send_signal(signal.SIGTERM)
-            time.sleep(3)
-            if proc.poll() is None:
-                proc.kill()
-        except Exception:
-            pass
-        rc = -1
+        with snapshot.wget_log.open("a", encoding="utf-8", errors="replace") as logf:
+            drain_thread = threading.Thread(target=_drain, args=(proc.stdout, logf), daemon=True)
+            drain_thread.start()
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                logging.warning(f"Timeout de {timeout}s excedido, encerrando wget")
+                try:
+                    proc.send_signal(signal.SIGTERM)
+                    time.sleep(3)
+                    if proc.poll() is None:
+                        proc.kill()
+                except Exception:
+                    pass
+                rc = -1
+            finally:
+                drain_thread.join(timeout=10)
+    except Exception as e:
+        logging.warning(f"Erro ao processar saída do wget: {e}")
 
     ok = rc in (0, 8)
     logging.info(f"wget encerrado (RC={rc}, ok={ok})")
