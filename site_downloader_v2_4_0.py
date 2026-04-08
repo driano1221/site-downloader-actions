@@ -2327,11 +2327,16 @@ class BatchTab:
             ))
 
     def _update_progress(self) -> None:
-        done  = sum(1 for j in self._jobs if j.status in ("concluido", "erro", "cancelado"))
-        total = len(self._jobs)
-        ok    = sum(1 for j in self._jobs if j.status == "concluido")
-        err   = sum(1 for j in self._jobs if j.status == "erro")
-        self.progress_var.set(f"{done}/{total} | ✅ {ok}  ❌ {err}")
+        done    = sum(1 for j in self._jobs if j.status in ("concluido", "parcial", "erro", "cancelado"))
+        total   = len(self._jobs)
+        ok      = sum(1 for j in self._jobs if j.status == "concluido")
+        partial = sum(1 for j in self._jobs if j.status == "parcial")
+        err     = sum(1 for j in self._jobs if j.status == "erro")
+        parts = [f"{done}/{total}", f"✅ {ok}"]
+        if partial:
+            parts.append(f"⚠️ {partial}")
+        parts.append(f"❌ {err}")
+        self.progress_var.set("  ".join(parts))
 
     # ------------------------------------------------------------------
     # Ações principais
@@ -2617,12 +2622,14 @@ class BatchTab:
             logging.warning(f"Erro ao atualizar índice: {idx_err}")
 
     def _on_batch_done(self) -> None:
-        ok    = sum(1 for j in self._jobs if j.status == "concluido")
-        err   = sum(1 for j in self._jobs if j.status == "erro")
-        canc  = sum(1 for j in self._jobs if j.status == "cancelado")
-        total = len(self._jobs)
+        ok      = sum(1 for j in self._jobs if j.status == "concluido")
+        partial = sum(1 for j in self._jobs if j.status == "parcial")
+        err     = sum(1 for j in self._jobs if j.status == "erro")
+        canc    = sum(1 for j in self._jobs if j.status == "cancelado")
+        total   = len(self._jobs)
         self._log(f"\n{'='*60}")
-        self._log(f"Batch concluído: {total} sites | ✅ {ok} OK | ❌ {err} erros | ⏹ {canc} cancelados")
+        summary = f"Batch concluído: {total} sites | ✅ {ok} OK | ⚠️ {partial} parcial | ❌ {err} erros | ⏹ {canc} cancelados"
+        self._log(summary)
         self._log(f"{'='*60}")
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
