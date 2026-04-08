@@ -66,7 +66,25 @@ Para reprocessar um site já baixado, remova-o de [`processed_urls.txt`](./proce
 | `processed_urls.txt` | Controle de URLs já processadas (atualizado pelo CI) |
 | `history.md` | Histórico de execuções com status, duração e tamanho |
 | `downloader_cli.py` | Script Python headless de download |
+| `site_downloader_v2_4_0.py` | Aplicativo desktop com interface gráfica |
 | `.github/workflows/download_sites.yml` | Workflow do GitHub Actions |
+
+---
+
+## Uso local (interface gráfica)
+
+Execute `site_downloader_v2_4_0.py` com Python 3.8+ e wget instalado.  
+Na aba **Batch** é possível baixar múltiplos sites em fila, com controle de timeout e quota por site.
+
+---
+
+## Alterações recentes (v2.4.0)
+
+- **Correção crítica:** timeout do batch estava definido incorretamente como ~7 dias; corrigido para 2h por site (configurável)
+- **Snapshots parciais salvos automaticamente:** se um download for interrompido por timeout ou pelo usuário, os arquivos já baixados são preservados com manifest, checksums e ABRIR_AQUI.html
+- **Novo status `⚠️ parcial`** para distinguir downloads incompletos de erros reais
+- **Controles de timeout e quota** na aba Batch — defina quantas horas e quantos MB por site
+- **`_index.html` mestre** gerado automaticamente na pasta de destino após cada site, listando todos os snapshots com status, tamanho e links diretos
 
 ---
 

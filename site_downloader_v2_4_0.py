@@ -41,8 +41,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 
-APP_TITLE = "Site Downloader v2.6.0 — Melhorado e Robusto"
-APP_VERSION = "2.6.0"
+APP_TITLE = "Site Downloader v2.4.0 — Melhorado e Robusto"
+APP_VERSION = "2.4.0"
 DEFAULT_USER_AGENT = "SiteDownloader/2.4 (+offline+warc)"
 
 
@@ -59,8 +59,10 @@ class AppConfig:
     file_hash_buffer_size: int = 8 * 1024 * 1024  # 8MB
     
     # Timeout
-    subprocess_timeout: int = 600000  # 10 minutos
+    subprocess_timeout: int = 86400          # 24 horas (aba Download individual)
     subprocess_cleanup_timeout: int = 30
+    batch_per_site_timeout_s: int = 7200     # 2 horas por site no batch (padrão)
+    batch_quota_mb: int = 0                  # 0 = sem limite de quota por site
     
     # Retry
     io_retry_attempts: int = 3
@@ -1442,13 +1444,20 @@ Arquivamento & Verificação
         
         self.root.after(0, _ui_finalize)
 
-    def _finalize_artifacts(self, snapshot: SnapshotPaths, ok: bool) -> None:
-        """Finaliza artifacts (manifest, hashes, ABRIR_AQUI.html)"""
+    def _finalize_artifacts(self, snapshot: SnapshotPaths, ok: bool, url: str | None = None) -> None:
+        """Finaliza artifacts (manifest, hashes, ABRIR_AQUI.html).
+
+        Args:
+            url: URL do site baixado. Se None, usa self.url_var (modo single-site).
+        """
+        if url is None:
+            url = self.url_var.get().strip()
+
         # Encontra entrada offline
         offline_entry = None
         if self.offline_var.get():
             try:
-                offline_entry = self._find_offline_entry(snapshot.offline, url=self.url_var.get().strip())
+                offline_entry = self._find_offline_entry(snapshot.offline, url=url)
             except Exception as e:
                 logging.warning(f"Erro ao encontrar offline entry: {e}")
         
@@ -1504,20 +1513,19 @@ Arquivamento & Verificação
         
         data["result"]["hashes"] = hashes
         
-        # Hash completo de OFFLINE (se habilitado)
+        # Hash completo de OFFLINE (se habilitado) — usa os.walk para melhor performance
         if self.full_hash_var.get() and self.offline_var.get():
             self.log("[INFO] Calculando hashes de todos os arquivos OFFLINE (pode demorar)...\n")
             full_hashes = {}
-            
             try:
-                for p in snapshot.offline.rglob("*"):
-                    if p.is_file():
+                for dirpath, _, filenames in os.walk(str(snapshot.offline)):
+                    for fn in filenames:
+                        fp = Path(dirpath) / fn
                         try:
-                            rel = str(p.relative_to(snapshot.root)).replace("\\", "/")
-                            full_hashes[rel] = sha256_file(p)
+                            rel = str(fp.relative_to(snapshot.root)).replace("\\", "/")
+                            full_hashes[rel] = sha256_file(fp)
                         except Exception as e:
-                            logging.warning(f"Erro ao calcular hash de {p.name}: {e}")
-                
+                            logging.warning(f"Erro ao calcular hash de {fp.name}: {e}")
                 data["result"]["full_hashes_offline_sha256"] = full_hashes
             except Exception as e:
                 logging.error(f"Erro ao calcular hashes completos: {e}", exc_info=True)
@@ -2037,6 +2045,150 @@ class PdfTab:
 
 
 # ============================================================================
+# ÍNDICE MESTRE DE SNAPSHOTS
+# ============================================================================
+
+def _fmt_bytes(b: int) -> str:
+    """Formata bytes em unidade legível."""
+    if b < 1024:
+        return f"{b} B"
+    elif b < 1024 ** 2:
+        return f"{b / 1024:.1f} KB"
+    elif b < 1024 ** 3:
+        return f"{b / 1024 ** 2:.1f} MB"
+    return f"{b / 1024 ** 3:.2f} GB"
+
+
+def update_dest_index(dest: Path) -> None:
+    """
+    Gera/atualiza _index.html na pasta de destino listando todos os snapshots.
+    Chamado automaticamente após cada site concluído no batch.
+    """
+    entries = []
+    try:
+        manifest_paths = []
+        for dirpath, dirnames, filenames in os.walk(str(dest)):
+            # Não entrar em subpastas de evidência/logs para evitar falsos positivos
+            dirnames[:] = [d for d in dirnames if d not in ("EVIDENCIA", "LOGS", "META", "OFFLINE", "_PDFs")]
+            if "manifest.json" in filenames:
+                manifest_paths.append(Path(dirpath) / "manifest.json")
+
+        # Ordena do mais recente ao mais antigo
+        manifest_paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+        for manifest_path in manifest_paths:
+            try:
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            url = data.get("url", "?")
+            created_at = data.get("created_at", "")
+            result = data.get("result", {})
+            ok = result.get("ok", None)
+            stats = result.get("stats", {})
+            total_files = stats.get("total_files", 0)
+            total_bytes = stats.get("total_bytes", 0)
+            elapsed = stats.get("elapsed_seconds", 0)
+
+            snap_root = manifest_path.parent.parent  # META/ → snapshot root
+            try:
+                rel = snap_root.relative_to(dest)
+                abrir_href = rel.as_posix() + "/ABRIR_AQUI.html"
+            except ValueError:
+                abrir_href = str(snap_root / "ABRIR_AQUI.html")
+
+            if ok is True:
+                status_icon, status_color = "✅ OK", "#28a745"
+            elif ok is False:
+                status_icon, status_color = "⚠️ Parcial", "#e67e22"
+            else:
+                status_icon, status_color = "❓ Pendente", "#6c757d"
+
+            date_fmt = created_at[:19].replace("T", " ") if created_at else ""
+            h = int(elapsed // 3600)
+            m = int((elapsed % 3600) // 60)
+            s = int(elapsed % 60)
+            elapsed_fmt = f"{h:02d}:{m:02d}:{s:02d}" if elapsed else "—"
+            domain = snap_root.parent.name
+
+            entries.append({
+                "url": url,
+                "domain": domain,
+                "date": date_fmt,
+                "status_icon": status_icon,
+                "status_color": status_color,
+                "total_files": total_files,
+                "size": _fmt_bytes(total_bytes),
+                "elapsed": elapsed_fmt,
+                "abrir_href": abrir_href,
+            })
+    except Exception as e:
+        logging.warning(f"update_dest_index: erro ao coletar snapshots: {e}")
+
+    if not entries:
+        return
+
+    rows = ""
+    for e in entries:
+        url_display = e["url"][:70] + "…" if len(e["url"]) > 70 else e["url"]
+        rows += (
+            f'<tr>'
+            f'<td><span style="color:{e["status_color"]}">{e["status_icon"]}</span></td>'
+            f'<td><a href="{e["url"]}" target="_blank">{url_display}</a></td>'
+            f'<td>{e["domain"]}</td>'
+            f'<td>{e["date"]}</td>'
+            f'<td style="text-align:right">{e["total_files"]:,}</td>'
+            f'<td style="text-align:right">{e["size"]}</td>'
+            f'<td style="text-align:right">{e["elapsed"]}</td>'
+            f'<td><a href="{e["abrir_href"]}">📂 Abrir</a></td>'
+            f'</tr>\n'
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Índice de Snapshots — Site Downloader v{APP_VERSION}</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f7fa;padding:30px;margin:0}}
+  h1{{color:#333;margin-bottom:4px}}
+  .sub{{color:#888;font-size:13px;margin-bottom:24px}}
+  table{{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.1)}}
+  th{{background:#667eea;color:#fff;padding:11px 10px;text-align:left;font-weight:600;font-size:13px}}
+  td{{padding:9px 10px;border-bottom:1px solid #eef0f5;font-size:12px;vertical-align:middle}}
+  tr:last-child td{{border-bottom:none}}
+  tr:hover td{{background:#f0f3ff}}
+  a{{color:#667eea;text-decoration:none}}
+  a:hover{{text-decoration:underline}}
+  .footer{{text-align:center;color:#bbb;font-size:11px;margin-top:20px}}
+</style>
+</head>
+<body>
+<h1>📦 Índice de Snapshots</h1>
+<p class="sub">Site Downloader v{APP_VERSION} &nbsp;·&nbsp; {datetime.now().strftime("%d/%m/%Y %H:%M")} &nbsp;·&nbsp; {len(entries)} snapshot(s)</p>
+<table>
+<thead><tr>
+  <th>Status</th><th>URL</th><th>Domínio</th><th>Data</th>
+  <th>Arquivos</th><th>Tamanho</th><th>Duração</th><th>Abrir</th>
+</tr></thead>
+<tbody>
+{rows}</tbody>
+</table>
+<div class="footer">Site Downloader v{APP_VERSION} — índice gerado automaticamente</div>
+</body>
+</html>"""
+
+    try:
+        index_path = dest / "_index.html"
+        index_path.write_text(html, encoding="utf-8")
+        logging.info(f"Índice mestre atualizado: {index_path}")
+    except Exception as e:
+        logging.warning(f"Erro ao escrever _index.html: {e}")
+
+
+# ============================================================================
 # BATCH — DOWNLOAD DE MÚLTIPLOS SITES
 # ============================================================================
 
@@ -2055,6 +2207,7 @@ class BatchJob:
             "aguardando":   "⏳",
             "em_andamento": "⬇️",
             "concluido":    "✅",
+            "parcial":      "⚠️",
             "erro":         "❌",
             "cancelado":    "⏹",
         }.get(self.status, "?")
@@ -2101,6 +2254,18 @@ class BatchTab:
 
         self.progress_var = tk.StringVar(value="")
         ttk.Label(btn_bar, textvariable=self.progress_var, foreground="#444").pack(side="left", padx=10)
+
+        # --- Configurações de batch ---
+        cfg_bar = ttk.Frame(frame)
+        cfg_bar.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(cfg_bar, text="Timeout por site (horas):").pack(side="left")
+        self.batch_timeout_var = tk.StringVar(value=str(CONFIG.batch_per_site_timeout_s // 3600))
+        ttk.Spinbox(cfg_bar, textvariable=self.batch_timeout_var, from_=0.5, to=24, increment=0.5, width=6).pack(side="left", padx=4)
+        ttk.Label(cfg_bar, text="  Quota por site (MB, 0=ilimitado):").pack(side="left")
+        self.batch_quota_var = tk.StringVar(value=str(CONFIG.batch_quota_mb))
+        ttk.Spinbox(cfg_bar, textvariable=self.batch_quota_var, from_=0, to=50000, increment=500, width=7).pack(side="left", padx=4)
+        ttk.Label(cfg_bar, text="  ⚠️ Sites parciais (timeout/parada) são salvos automaticamente", foreground="#888").pack(side="left", padx=8)
 
         # --- Tabela de progresso ---
         cols = ("icon", "url", "status", "elapsed", "snapshot")
@@ -2162,11 +2327,16 @@ class BatchTab:
             ))
 
     def _update_progress(self) -> None:
-        done  = sum(1 for j in self._jobs if j.status in ("concluido", "erro", "cancelado"))
-        total = len(self._jobs)
-        ok    = sum(1 for j in self._jobs if j.status == "concluido")
-        err   = sum(1 for j in self._jobs if j.status == "erro")
-        self.progress_var.set(f"{done}/{total} | ✅ {ok}  ❌ {err}")
+        done    = sum(1 for j in self._jobs if j.status in ("concluido", "parcial", "erro", "cancelado"))
+        total   = len(self._jobs)
+        ok      = sum(1 for j in self._jobs if j.status == "concluido")
+        partial = sum(1 for j in self._jobs if j.status == "parcial")
+        err     = sum(1 for j in self._jobs if j.status == "erro")
+        parts = [f"{done}/{total}", f"✅ {ok}"]
+        if partial:
+            parts.append(f"⚠️ {partial}")
+        parts.append(f"❌ {err}")
+        self.progress_var.set("  ".join(parts))
 
     # ------------------------------------------------------------------
     # Ações principais
@@ -2290,7 +2460,7 @@ class BatchTab:
     def _run_single(self, job: BatchJob) -> None:
         """
         Executa download de um único site.
-        Reutiliza _build_wget_args e _finalize_artifacts do App.
+        Salva snapshot parcial mesmo em caso de timeout ou cancelamento.
         """
         url = job.url
         dest = validate_destination_path(self.app.dest_var.get(), create=True)
@@ -2302,7 +2472,20 @@ class BatchTab:
         snapshot = SnapshotPaths.create(dest, domain)
         job.snapshot_root = snapshot.root
 
-        # Manifest inicial
+        # Lê timeout configurado na UI (em horas)
+        try:
+            timeout_h = float(self.batch_timeout_var.get() or "2")
+            timeout_sec = max(60, int(timeout_h * 3600))
+        except (ValueError, AttributeError):
+            timeout_sec = CONFIG.batch_per_site_timeout_s
+
+        # Lê quota configurada na UI (em MB, 0=sem limite)
+        try:
+            quota_mb = int(float(self.batch_quota_var.get() or "0"))
+        except (ValueError, AttributeError):
+            quota_mb = CONFIG.batch_quota_mb
+
+        # Manifest inicial (salvo antes de qualquer download)
         manifest_data = {
             "version": APP_VERSION,
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -2311,6 +2494,8 @@ class BatchTab:
             "options": self.app._get_options_dict(),
             "wget_command": wget_cmd,
             "batch": True,
+            "batch_timeout_s": timeout_sec,
+            "batch_quota_mb": quota_mb,
         }
         try:
             snapshot.manifest.write_text(
@@ -2319,15 +2504,17 @@ class BatchTab:
         except Exception as e:
             logging.warning(f"Erro ao salvar manifest inicial batch: {e}")
 
-        # Sobrescreve url_var temporariamente para _build_wget_args
-        old_url = self.app.url_var.get()
-        self.app.url_var.set(url)
-        try:
-            args = self.app._build_wget_args(wget_cmd, url, snapshot)
-        finally:
-            self.app.url_var.set(old_url)
+        args = self.app._build_wget_args(wget_cmd, url, snapshot)
 
-        self._ui(lambda u=url: self._log(f"[WGET] Iniciando: {u}"))
+        # Adiciona quota se configurada (antes da URL, que é o último argumento)
+        if quota_mb > 0:
+            args.insert(-1, f"--quota={quota_mb}m")
+            self._ui(lambda q=quota_mb: self._log(f"[INFO] Quota: {q} MB por site"))
+
+        timeout_h_disp = timeout_sec / 3600
+        self._ui(lambda u=url, t=timeout_h_disp: self._log(
+            f"[WGET] Iniciando: {u}  (timeout: {t:.1f}h)"
+        ))
 
         # Executa wget
         try:
@@ -2343,7 +2530,8 @@ class BatchTab:
             raise RuntimeError(f"Falha ao iniciar wget: {e}") from e
         if self._proc.stdout is None:
             raise RuntimeError("Falha ao capturar stdout do wget")
-        # Processa saída e grava log
+
+        # Processa saída e grava log em paralelo
         try:
             logf = snapshot.wget_log.open("a", encoding="utf-8", errors="replace")
         except Exception:
@@ -2367,11 +2555,16 @@ class BatchTab:
         stream_thread = threading.Thread(target=_stream, daemon=True)
         stream_thread.start()
 
+        timed_out = False
         try:
-            timeout_sec = max(CONFIG.subprocess_timeout, 86400)
             rc = self._proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
-            self._ui(lambda: self._log(f"Timeout excedido para {url}"))
+            timed_out = True
+            h = timeout_sec // 3600
+            m = (timeout_sec % 3600) // 60
+            self._ui(lambda: self._log(
+                f"[WARN] Timeout de {h}h{m:02d}m excedido. Salvando snapshot parcial..."
+            ))
             try:
                 if self._proc and sys.platform.startswith("win"):
                     subprocess.run(
@@ -2382,43 +2575,61 @@ class BatchTab:
                         timeout=10,
                     )
                 elif self._proc:
-                    self._proc.kill()
-            except Exception as e:
-                self._ui(lambda: self._log(f"[WARN] Falha ao matar processo após timeout: {e}"))
+                    self._proc.send_signal(signal.SIGTERM)
+                    time.sleep(3)
+                    if self._proc.poll() is None:
+                        self._proc.kill()
+            except Exception as kill_err:
+                self._ui(lambda: self._log(f"[WARN] Erro ao encerrar wget: {kill_err}"))
             rc = -1
 
         stream_thread.join(timeout=5)
         self._proc = None
 
+        # Determina status — "parcial" para timeout/cancelamento (download incompleto mas salvo)
         if self._stop_event.is_set():
-            job.status = "cancelado"
-            return
-
-        ok = (rc in (0, 8))
-        if rc == 0:
+            job.status = "parcial"
+            job.error_msg = "Interrompido pelo usuário"
+            ok = False
+        elif timed_out:
+            h = timeout_sec // 3600
+            m = (timeout_sec % 3600) // 60
+            job.status = "parcial"
+            job.error_msg = f"Timeout após {h}h{m:02d}m"
+            ok = False
+        elif rc in (0, 8):
             job.status = "concluido"
-        elif rc == 8:
-            job.status = "concluido"
-            job.error_msg = "Alguns links estavam quebrados (404/403)"
+            ok = True
+            if rc == 8:
+                job.error_msg = "Alguns links estavam quebrados (404/403)"
         else:
             job.status = "erro"
             job.error_msg = f"wget retornou código {rc}"
+            ok = False
 
-        # Finaliza artifacts (manifest, checksums, ABRIR_AQUI.html)
+        # SEMPRE finaliza artifacts, mesmo em cancel/timeout — garante snapshot navegável
         try:
-            # Temporariamente ajusta url_var para _finalize_artifacts
-            self.app.url_var.set(url)
-            self.app._finalize_artifacts(snapshot, ok)
-        finally:
-            self.app.url_var.set(old_url)
+            self.app._finalize_artifacts(snapshot, ok, url=url)
+            self._ui(lambda s=str(snapshot.root): self._log(f"[✓] Snapshot salvo: {s}"))
+        except Exception as fin_err:
+            logging.error(f"Erro ao finalizar artifacts: {fin_err}")
+            self._ui(lambda e=fin_err: self._log(f"[ERRO] Falha ao finalizar artifacts: {e}"))
+
+        # Atualiza índice mestre da pasta de destino
+        try:
+            update_dest_index(dest)
+        except Exception as idx_err:
+            logging.warning(f"Erro ao atualizar índice: {idx_err}")
 
     def _on_batch_done(self) -> None:
-        ok    = sum(1 for j in self._jobs if j.status == "concluido")
-        err   = sum(1 for j in self._jobs if j.status == "erro")
-        canc  = sum(1 for j in self._jobs if j.status == "cancelado")
-        total = len(self._jobs)
+        ok      = sum(1 for j in self._jobs if j.status == "concluido")
+        partial = sum(1 for j in self._jobs if j.status == "parcial")
+        err     = sum(1 for j in self._jobs if j.status == "erro")
+        canc    = sum(1 for j in self._jobs if j.status == "cancelado")
+        total   = len(self._jobs)
         self._log(f"\n{'='*60}")
-        self._log(f"Batch concluído: {total} sites | ✅ {ok} OK | ❌ {err} erros | ⏹ {canc} cancelados")
+        summary = f"Batch concluído: {total} sites | ✅ {ok} OK | ⚠️ {partial} parcial | ❌ {err} erros | ⏹ {canc} cancelados"
+        self._log(summary)
         self._log(f"{'='*60}")
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
