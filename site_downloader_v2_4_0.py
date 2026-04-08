@@ -41,8 +41,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 
-APP_TITLE = "Site Downloader v2.6.0 — Melhorado e Robusto"
-APP_VERSION = "2.6.0"
+APP_TITLE = "Site Downloader v2.4.0 — Melhorado e Robusto"
+APP_VERSION = "2.4.0"
 DEFAULT_USER_AGENT = "SiteDownloader/2.4 (+offline+warc)"
 
 
